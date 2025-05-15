@@ -6,6 +6,8 @@ const multer = require('multer')
 const path = require('path')
 const fs = require('fs')
 const bcrypt = require('bcrypt') 
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
 dotenv.config()
 
@@ -145,11 +147,23 @@ Livro.hasMany(Emprestimo, { foreignKey: 'livroId' })
 Emprestimo.belongsTo(Usuario, { foreignKey: 'usuarioId' })
 Emprestimo.belongsTo(Livro, { foreignKey: 'livroId' })
 
-sequelize.sync({ alter: true }).then(() => {
+sequelize.sync({ force: false }).then(() => {
     console.log('Banco de dados e tabelas sincronizados!')
 }).catch((error) => {
     console.error('Erro ao sincronizar banco de dados:', error)
 })
+
+
+function autenticarToken(req, res, next) {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ erro: 'Token não fornecido' });
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, usuario) => {
+        if (err) return res.status(403).json({ erro: 'Token inválido' });
+        req.usuario = usuario;
+        next();
+    });
+}
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'Biblioteca-jb-front/index.html'));
@@ -204,25 +218,32 @@ app.post('/login-bibliotecario', async (req, res) => {
     const { email, senha } = req.body;
 
     try {
-        const bibliotecario = await Usuario.findOne({ where: { email, masp: { [Sequelize.Op.not]: null } } });
+        const bibliotecario = await Usuario.findOne({ where: { email } });
 
-        if (!bibliotecario) {
-            return res.status(401).json({ erro: 'Credenciais inválidas ou não é bibliotecário.' });
+        if (!bibliotecario || !bibliotecario.masp) {
+            return res.status(401).json({ erro: 'Usuário não é um bibliotecário ou não existe.' });
         }
 
-        // Comparar a senha fornecida com o hash armazenado
         const senhaValida = await bcrypt.compare(senha, bibliotecario.senha);
 
         if (!senhaValida) {
             return res.status(401).json({ erro: 'Credenciais inválidas.' });
         }
 
-        // Retornar as informações do bibliotecário sem a senha
+        const token = jwt.sign(
+            { id: bibliotecario.id, email: bibliotecario.email, masp: bibliotecario.masp },
+            process.env.JWT_SECRET,
+            { expiresIn: '1d' }
+        );
+
         res.status(200).json({
-            id: bibliotecario.id,
-            nome: bibliotecario.nome,
-            email: bibliotecario.email,
-            masp: bibliotecario.masp
+            token,
+            usuario: {
+                id: bibliotecario.id,
+                nome: bibliotecario.nome,
+                email: bibliotecario.email,
+                masp: bibliotecario.masp
+            }
         });
     } catch (error) {
         res.status(500).json({ erro: 'Erro no servidor: ' + error.message });
@@ -232,33 +253,60 @@ app.post('/login-bibliotecario', async (req, res) => {
 
 
 // Rota para login (com bcrypt para verificar a senha hasheada)
+// app.post('/login', async (req, res) => {
+//     const { email, senha } = req.body;
+
+//     try {
+//         const usuario = await Usuario.findOne({ where: { email } });
+
+//         if (!usuario) {
+//             return res.status(401).json({ erro: 'Credenciais inválidas.' });
+//         }
+
+//         // Comparar a senha fornecida com o hash armazenado
+//         const senhaValida = await bcrypt.compare(senha, usuario.senha);
+
+//         if (!senhaValida) {
+//             return res.status(401).json({ erro: 'Credenciais inválidas.' });
+//         }
+
+//         // Retornar as informações do usuário sem a senha
+//         res.status(200).json({
+//             id: usuario.id,
+//             nome: usuario.nome,
+//             email: usuario.email
+//         });
+//     } catch (error) {
+//         res.status(500).json({ erro: 'Erro no servidor: ' + error.message });
+//     }
+// })
+
+
 app.post('/login', async (req, res) => {
-    const { email, senha } = req.body;
-
     try {
+        const { email, senha } = req.body;
         const usuario = await Usuario.findOne({ where: { email } });
+        if (!usuario) return res.status(401).json({ erro: 'Credenciais inválidas' });
 
-        if (!usuario) {
-            return res.status(401).json({ erro: 'Credenciais inválidas.' });
-        }
-
-        // Comparar a senha fornecida com o hash armazenado
         const senhaValida = await bcrypt.compare(senha, usuario.senha);
+        if (!senhaValida) return res.status(401).json({ erro: 'Credenciais inválidas' });
 
-        if (!senhaValida) {
-            return res.status(401).json({ erro: 'Credenciais inválidas.' });
-        }
+        const token = jwt.sign({ id: usuario.id, email: usuario.email }, process.env.JWT_SECRET, { expiresIn: '1d' });
 
-        // Retornar as informações do usuário sem a senha
-        res.status(200).json({
-            id: usuario.id,
-            nome: usuario.nome,
-            email: usuario.email
+        res.json({
+            token,
+            usuario: {
+                id: usuario.id,
+                nome: usuario.nome,
+                email: usuario.email
+            }
         });
-    } catch (error) {
-        res.status(500).json({ erro: 'Erro no servidor: ' + error.message });
+    } catch (err) {
+        res.status(500).json({ erro: 'Erro no servidor: ' + err.message });
     }
-})
+});
+
+
 
 // Rota para adicionar livros
 app.post('/livros', upload.single('imagem'), async (req, res) => {
@@ -282,6 +330,39 @@ app.post('/livros', upload.single('imagem'), async (req, res) => {
         res.status(500).json({ erro: 'Erro no servidor: ' + error.message })
     }
 })
+
+app.post('/enviar-email', autenticarToken, async (req, res) => {
+    const { email, mensagem } = req.body;
+
+    if (!email || !mensagem) {
+        return res.status(400).json({ erro: 'Email e mensagem são obrigatórios.' });
+    }
+
+    // Configura seu email remetente
+    const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: process.env.EMAIL_USER,      // exemplo@gmail.com
+            pass: process.env.EMAIL_PASS       // senha de app do Gmail
+        }
+    });
+
+    const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: 'Lembrete de Devolução de Livro - Biblioteca',
+        text: mensagem
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        res.status(200).json({ mensagem: 'Email enviado com sucesso.' });
+    } catch (error) {
+        console.error('Erro ao enviar email:', error);
+        res.status(500).json({ erro: 'Erro ao enviar email.' });
+    }
+})
+
 
 // Rota para atualizar um livro
 app.put('/livros/:id', upload.single('imagem'), async (req, res) => {
